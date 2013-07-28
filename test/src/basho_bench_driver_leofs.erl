@@ -1,6 +1,6 @@
 %% -------------------------------------------------------------------
 %%
-%% basho_bench: Benchmarking Suite 
+%% basho_bench: Benchmarking Suite
 %%
 %% Copyright (c) 2012 Rakuten, Inc.
 %%
@@ -25,17 +25,31 @@
          run/4]).
 
 -include("basho_bench.hrl").
+-include("leo_s3_auth.hrl").
 
 -record(url, {abspath, host, port, username, password, path, protocol, host_type}).
 
 -record(state, { base_urls,          % Tuple of #url -- one for each IP
                  base_urls_index,    % #url to use for next request
-                 path_params }).     % Params to append on the path
+                 path_params,        % Params to append on the path
+                 id,                 % Job ID passed through new/1 minus 1 -> 0... concurrent
+                 concurrent,         % Number of Job Processed
+                 check_integrity}).  % Params to test data integrity
+
+-define(S3_ACC_KEY,      "05236").
+-define(S3_SEC_KEY,      "802562235").
+-define(S3_CONTENT_TYPE, "application/octet-stream").
+-define(ETS_BODY_MD5, ets_body_md5).
 
 %% ====================================================================
 %% API
 %% ====================================================================
-new(_Id) ->
+new(Id) ->
+    %% Guaranteed One shot
+    case Id of
+        1 -> ets:new(?ETS_BODY_MD5, [public, named_table, {read_concurrency, true}]);
+        _ -> void
+    end,
     %% Make sure ibrowse is available
     case code:which(ibrowse) of
         non_existing ->
@@ -47,9 +61,9 @@ new(_Id) ->
     application:start(ibrowse),
 
     %% The IPs, port and path we'll be testing
-    Ips  = basho_bench_config:get(http_raw_ips,      ["127.0.0.1"]),
+    Ips  = basho_bench_config:get(http_raw_ips,      ["localhost"]),
     Port = basho_bench_config:get(http_raw_port,     8080),
-    Path = basho_bench_config:get(http_raw_path,     "/air/_test"),
+    Path = basho_bench_config:get(http_raw_path,     "/test_bucket/_test"),
     Params = basho_bench_config:get(http_raw_params, ""),
     Disconnect = basho_bench_config:get(http_raw_disconnect_frequency, infinity),
 
@@ -75,45 +89,81 @@ new(_Id) ->
                                        || Ip <- Ips]),
             BaseUrlsIndex = random:uniform(tuple_size(BaseUrls))
     end,
-
+    CI = basho_bench_config:get(
+           check_integrity, false), %% should be false when doing benchmark
+    Concurrent = basho_bench_config:get(concurrent, 0),
     {ok, #state { base_urls = BaseUrls,
                   base_urls_index = BaseUrlsIndex,
-                  path_params = Params }}.
+                  path_params = Params,
+                  id = Id - 1,
+                  concurrent = Concurrent,
+                  check_integrity = CI }}.
 
+keygen_global_uniq(false, _Id, _Concurrent, KeyGen) ->
+    KeyGen();
+keygen_global_uniq(true, Id, Concurrent, KeyGen) ->
+    Base = KeyGen(),
+    Rem = Base rem Concurrent,
+    Diff = Rem - Id,
+    Base - Diff.
 
-run(get, KeyGen, _ValueGen, State) ->
+run(get, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
     {NextUrl, S2} = next_url(State),
-    case do_get(url(NextUrl, KeyGen, State#state.path_params)) of
+    case do_get(url(NextUrl, Key, State#state.path_params)) of
         {not_found, _Url} ->
             {ok, S2};
-        {ok, _Url, _Headers} ->
-            {ok, S2};
+        {ok, _Url, _Headers, Body} ->
+            case CI of
+                true ->
+                    case ets:lookup(?ETS_BODY_MD5, Key) of
+                        [{_Key, LocalMD5}|_] ->
+                            RemoteMD5 = erlang:md5(Body),
+                            case RemoteMD5 =:= LocalMD5 of
+                                true -> {ok, S2};
+                                false -> {error, checksum_error, S2}
+                            end;
+                        _ -> {ok, S2}
+                    end;
+                false -> {ok, S2}
+            end;
         {error, Reason} ->
             io:format("~p~n",[Reason]),
             {error, Reason, S2}
     end;
 
 
-run(put, KeyGen, ValueGen, State) ->
+run(put, KeyGen, ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
+    Val = ValueGen(),
     {NextUrl, S2} = next_url(State),
-    Url = url(NextUrl, KeyGen, State#state.path_params),
-
-    case do_put(Url, [], ValueGen) of
+    Url = url(NextUrl, Key, State#state.path_params),
+    case do_put(Url, [], Val) of
         ok ->
+            case CI of
+                true ->
+                    LocalMD5 = erlang:md5(Val),
+                    ets:insert(?ETS_BODY_MD5, {Key, LocalMD5});
+                false -> void
+            end,
             {ok, S2};
         {error, Reason} ->
             {error, Reason, S2}
     end;
 
 
-run(delete, KeyGen, _ValueGen, State) ->
+run(delete, KeyGen, _ValueGen, #state{check_integrity = CI, id = Id, concurrent = Concurrent} = State) ->
+    Key = keygen_global_uniq(CI, Id, Concurrent, KeyGen),
     {NextUrl, S2} = next_url(State),
-    %% Url = url(NextUrl, KeyGen, State#state.path_params),
-
-    case do_delete(url(NextUrl, KeyGen, State#state.path_params)) of
+    case do_delete(url(NextUrl, Key, State#state.path_params)) of
         {not_found, _Url} ->
             {ok, S2};
         {ok, _Url, _Headers} ->
+            case CI of
+                true ->
+                    ets:delete(?ETS_BODY_MD5, Key);
+                false -> void
+            end,
             {ok, S2};
         {error, Reason} ->
             {error, Reason, S2}
@@ -137,25 +187,39 @@ next_url(State) ->
 
 %% url(BaseUrl, Params) ->
 %%     BaseUrl#url { path = lists:concat([BaseUrl#url.path, Params]) }.
-url(BaseUrl, KeyGen, Params) ->
-    BaseUrl#url { path = lists:concat([BaseUrl#url.path, '/', KeyGen(), Params]) }.
+url(BaseUrl, Key, Params) ->
+    BaseUrl#url { path = lists:concat([BaseUrl#url.path, '/', Key, Params]) }.
 
 
 do_get(Url) ->
     case send_request(Url, [], get, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
             {not_found, Url};
-        {ok, "200", Headers, _Body} ->
-            {ok, Url, Headers};
+        {ok, "200", Headers, Body} ->
+            {ok, Url, Headers, Body};
         {ok, Code, _Headers, _Body} ->
             {error, {http_error, Code}};
         {error, Reason} ->
             {error, Reason}
     end.
 
-do_put(Url, Headers, ValueGen) ->
-    case send_request(Url, Headers ++ [{'Content-Type', 'application/octet-stream'}],
-                      put, ValueGen(), [{response_format, binary}]) of
+gen_sig(HTTPMethod, Url) ->
+    [Bucket|_] = string:tokens(Url#url.path, "/"),
+    SignParams = #sign_params{http_verb    = HTTPMethod,
+                              content_md5  = [],
+                              content_type = ?S3_CONTENT_TYPE,
+                              date         = [],
+                              bucket       = Bucket,
+                              uri          = Url#url.path,
+                              query_str    = [],
+                              amz_headers  = []
+                             },
+    Sig = leo_s3_auth:get_signature(?S3_SEC_KEY, SignParams),
+    io_lib:format("AWS ~s:~s", [?S3_ACC_KEY, Sig]).
+
+do_put(Url, Headers, Value) ->
+    case send_request(Url, Headers ++ [{'Content-Type', ?S3_CONTENT_TYPE}, {'Authorization', gen_sig("PUT", Url)}],
+                      put, Value, [{response_format, binary}]) of
         {ok, "200", _Header, _Body} ->
             ok;
         {ok, "204", _Header, _Body} ->
@@ -182,7 +246,7 @@ do_put(Url, Headers, ValueGen) ->
 %%     end.
 
 do_delete(Url) ->
-    case send_request(Url, [], delete, [], [{response_format, binary}]) of
+    case send_request(Url, [{'Authorization', gen_sig("DELETE", Url)}], delete, [], [{response_format, binary}]) of
         {ok, "404", _Headers, _Body} ->
             {not_found, Url};
         {ok, "200", Headers, _Body} ->
@@ -272,8 +336,8 @@ send_request(_Url, _Headers, _Method, _Body, _Options, 0) ->
 send_request(Url, Headers, Method, Body, Options, Count) ->
     Pid = connect(Url),
     case catch(ibrowse_http_client:send_req(
-           Pid, Url, Headers, Method, Body, Options,
-           basho_bench_config:get(http_raw_request_timeout, 5000))) of
+                 Pid, Url, Headers, Method, Body, Options,
+                 basho_bench_config:get(http_raw_request_timeout, 5000))) of
 
         {ok, Status, RespHeaders, RespBody} ->
             maybe_disconnect(Url),
